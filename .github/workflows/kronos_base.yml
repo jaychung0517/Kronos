@@ -1,0 +1,60 @@
+
+name: Kronos Base Taiwan Forecast
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # UTC 08:30 = Taiwan 16:30
+    - cron: "30 8 * * 1-5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kronos-base-tw
+  cancel-in-progress: false
+
+jobs:
+  forecast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout Kronos
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install yfinance matplotlib
+
+      - name: Verify Kronos imports
+        run: |
+          python -c "import torch; print('PyTorch:', torch.__version__)"
+          python -c "from model import Kronos, KronosTokenizer, KronosPredictor; print('Kronos import OK')"
+
+      - name: Run forecast
+        env:
+          KRONOS_MODEL: NeoQuasar/Kronos-base
+          OMP_NUM_THREADS: "2"
+        run: |
+          python scripts/forecast.py \
+            --lookback 400 \
+            --horizon 5 \
+            --samples 1
+
+      - name: Upload outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kronos-base-forecast
+          path: outputs/
+          if-no-files-found: warn
+          retention-days: 30
