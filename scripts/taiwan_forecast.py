@@ -1,4 +1,4 @@
-"""Kronos-base: TAIEX and TX combined day + night daily forecast.
+"""Kronos-base v2: TAIEX and TX day/night four-scenario forecast experiment.
 
 Run from the official Kronos repository root:
     python -m scripts.taiwan_forecast
@@ -8,11 +8,13 @@ FinMind dataset: TaiwanFuturesDaily, data_id=TX.
 
 This program is for research; continuous futures use backward additive adjustments.
 Future dates fall back to weekdays if data/trading_calendar.csv is not provided.
+This is a parameter sensitivity comparison, NOT a historical accuracy backtest.
 """
 
 from __future__ import annotations
 
 import json
+import random
 import os
 import time
 import traceback
@@ -35,9 +37,16 @@ from model import Kronos, KronosTokenizer, KronosPredictor
 TZ = ZoneInfo("Asia/Taipei")
 MODEL_NAME = os.getenv("KRONOS_MODEL", "NeoQuasar/Kronos-base")
 TOKENIZER_NAME = "NeoQuasar/Kronos-Tokenizer-base"
-LOOKBACK = int(os.getenv("LOOKBACK", "400"))
-HORIZON = int(os.getenv("HORIZON", "5"))
-SAMPLE_COUNT = int(os.getenv("SAMPLE_COUNT", "1"))
+LOOKBACK = 400  # The largest required historical window (also required for TX assembly).
+HORIZON = 5
+EXPERIMENTS = [
+    ("A", 200, 1),
+    ("B", 200, 5),
+    ("C", 400, 1),
+    ("D", 400, 5),
+]
+BASE_SEED = int(os.getenv("KRONOS_SEED", "20261104"))
+STRICT_CALENDAR = os.getenv("STRICT_TRADING_CALENDAR", "0").lower() in ("true", "1", "yes")
 MAX_STALE_DAYS = int(os.getenv("MAX_STALE_DAYS", "7"))
 MIN_NIGHT_COVERAGE = float(os.getenv("MIN_NIGHT_COVERAGE", "0.97"))
 MAX_OVERLAP_AGE_DAYS = int(os.getenv("MAX_OVERLAP_AGE_DAYS", "10"))
@@ -361,6 +370,8 @@ def future_market_dates(last_date: pd.Timestamp, horizon: int):
     a proxy for TAIFEX where occasional schedule differences may apply.
     """
     if not CALENDAR_FILE.exists():
+        if STRICT_CALENDAR:
+            raise RuntimeError("STRICT_TRADING_CALENDAR=1 but data/trading_calendar.csv is missing")
         log("[CALENDAR] WARNING: no calendar CSV; weekdays-only forecast dates (holidays may be wrong)")
         return pd.bdate_range(
             pd.Timestamp(last_date) + pd.Timedelta(days=1), periods=horizon
@@ -383,38 +394,23 @@ def future_market_dates(last_date: pd.Timestamp, horizon: int):
     return pd.DatetimeIndex(future["date"]), "csv_calendar"
 
 
-def predict_market(predictor, name: str, frame: pd.DataFrame, future_dates) -> dict:
-    log(f"[MODEL] predicting {name}")
-    start = time.monotonic()
-    with torch.inference_mode():
-        pred = predictor.predict(
-            df=frame[OHLC].reset_index(drop=True),
-            x_timestamp=pd.Series(pd.DatetimeIndex(frame.index)).reset_index(drop=True),
-            y_timestamp=pd.Series(pd.DatetimeIndex(future_dates)).reset_index(drop=True),
-            pred_len=HORIZON,
-            T=1.0, top_p=0.9,
-            sample_count=SAMPLE_COUNT,
-            verbose=False,
-        )
-    if len(pred) != HORIZON or any(x not in pred.columns for x in OHLC):
-        raise RuntimeError(f"Kronos returned invalid {name} forecast shape/columns")
-    pred = pred[OHLC].copy().reset_index(drop=True)
-    for col in OHLC:
-        pred[col] = pd.to_numeric(pred[col], errors="coerce")
-    validate_ohlc(pred, f"{name} forecast")
-    pred.index = pd.DatetimeIndex(future_dates)
-    pred.index.name = "date"
-    last_close = float(frame["close"].iloc[-1])
-    pred["return_pct"] = (pred["close"] / last_close - 1.0) * 100
-    pred.to_csv(OUTPUT / f"{name}_forecast.csv", encoding="utf-8-sig")
+def seed_everything(seed: int) -> None:
+    """Set common PRNGs; numerical reproducibility still depends on libraries/CPU."""
+    random.seed(seed)
+    np.random.seed(seed % (2**32 - 1))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def plot_single_market(frame: pd.DataFrame, pred: pd.DataFrame, name: str) -> None:
     history = frame["close"].tail(60)
-    linked = pd.concat([
-        pd.Series([last_close], index=[frame.index[-1]]), pred["close"]
-    ])
+    last_close = float(frame["close"].iloc[-1])
+    linked = pd.concat([pd.Series([last_close], index=[frame.index[-1]]), pred["close"]])
     fig, ax = plt.subplots(figsize=(11, 5.5))
     ax.plot(history.index, history.to_numpy(), label="Historical close")
-    ax.plot(linked.index, linked.to_numpy(), "--o", label="Kronos forecast")
-    ax.set_title(f"Kronos-base {name}: daily forecast")
+    ax.plot(linked.index, linked.to_numpy(), "--o", label="Kronos D (400 / 5)")
+    ax.set_title(f"Kronos-base {name}: Scenario D forecast")
     ax.set_ylabel("Index points")
     ax.grid(alpha=0.25)
     ax.legend()
@@ -422,22 +418,203 @@ def predict_market(predictor, name: str, frame: pd.DataFrame, future_dates) -> d
     fig.tight_layout()
     fig.savefig(OUTPUT / f"{name}_forecast.png", dpi=150)
     plt.close(fig)
+
+
+def predict_market(predictor, name: str, frame: pd.DataFrame,
+                   future_dates, scenario: str, lookback: int, samples: int):
+    """Run one predefined scenario; returns complete forecast and summary."""
+    history = frame[OHLC].tail(lookback)
+    if len(history) < lookback:
+        raise RuntimeError(f"{name} has {len(history)} bars, scenario needs {lookback}")
+    # Same seed for 1-vs-5 samples with identical input window, per market.
+    seed = BASE_SEED + lookback * 10 + (0 if name == "TAIEX" else 1)
+    seed_everything(seed)
+    log(f"[EXPERIMENT {scenario}] {name}: lookback={lookback}, "
+        f"sample_count={samples}, seed={seed}")
+    started = time.monotonic()
+    with torch.inference_mode():
+        pred = predictor.predict(
+            df=history.reset_index(drop=True),
+            x_timestamp=pd.Series(pd.DatetimeIndex(history.index)).reset_index(drop=True),
+            y_timestamp=pd.Series(pd.DatetimeIndex(future_dates)).reset_index(drop=True),
+            pred_len=HORIZON,
+            T=1.0, top_p=0.9,
+            sample_count=samples,
+            verbose=False,
+        )
+    if not isinstance(pred, pd.DataFrame) or len(pred) != HORIZON:
+        raise RuntimeError(f"{name} scenario {scenario}: invalid predictor result length/type")
+    if any(x not in pred.columns for x in OHLC):
+        raise RuntimeError(f"{name} scenario {scenario}: prediction missing OHLC")
+    pred = pred[OHLC].copy().reset_index(drop=True)
+    for col in OHLC:
+        pred[col] = pd.to_numeric(pred[col], errors="coerce")
+    validate_ohlc(pred, f"{name} scenario {scenario} forecast")
+    pred.index = pd.DatetimeIndex(future_dates)
+    pred.index.name = "date"
+    last_close = float(frame["close"].iloc[-1])
+    pred["return_pct"] = (pred["close"] / last_close - 1.0) * 100.0
+    pred.to_csv(OUTPUT / f"{name}_{scenario}_forecast.csv", encoding="utf-8-sig")
+    if scenario == "D":
+        # Compatibility files: scenario D only, not a verified best choice.
+        pred.to_csv(OUTPUT / f"{name}_forecast.csv", encoding="utf-8-sig")
+        plot_single_market(frame, pred, name)
     summary = {
         "market": name,
+        "scenario": scenario,
+        "lookback": lookback,
+        "sample_count": samples,
+        "random_seed": seed,
         "last_date": str(frame.index[-1].date()),
         "last_close": last_close,
         "forecast": {
             f"day_{d}": {
-                "date": str(pred.index[d-1].date()),
-                "close": float(pred["close"].iloc[d-1]),
-                "return_pct": float(pred["return_pct"].iloc[d-1]),
+                "date": str(pred.index[d - 1].date()),
+                "close": float(pred["close"].iloc[d - 1]),
+                "return_pct": float(pred["return_pct"].iloc[d - 1]),
             }
-            for d in (1, 3, 5) if d <= HORIZON
+            for d in (1, 3, 5)
         },
-        "prediction_seconds": round(time.monotonic() - start, 2),
+        "prediction_seconds": round(time.monotonic() - started, 3),
     }
-    log(f"[MODEL] finished {name}: {summary['forecast']}")
-    return summary
+    return pred, summary
+
+
+def historical_reference(taiex: pd.DataFrame, tx: pd.DataFrame) -> pd.DataFrame:
+    """Descriptive 99th-percentile bounds, NOT calibrated forecast uncertainty."""
+    aligned = pd.concat({
+        "TAIEX": taiex["close"], "TX": tx["close"]
+    }, axis=1, join="inner").dropna().sort_index()
+    if len(aligned) < 150:
+        raise RuntimeError(f"Only {len(aligned)} overlapping historical trading dates")
+    log(f"[REFERENCE] common historical dates={len(aligned)}")
+    rows = []
+    for horizon in (1, 3, 5):
+        r = aligned.pct_change(periods=horizon, fill_method=None).dropna() * 100.0
+        gap = (r["TX"] - r["TAIEX"]).abs()
+        tx_abs = r["TX"].abs()
+        rows.append({
+            "day": horizon,
+            "observations": len(r),
+            "historical_abs_gap_p99_pp": float(gap.quantile(.99)),
+            "historical_abs_tx_return_p99_pct": float(tx_abs.quantile(.99)),
+            "historical_max_abs_gap_pp": float(gap.max()),
+            "historical_max_abs_tx_return_pct": float(tx_abs.max()),
+        })
+    result = pd.DataFrame(rows)
+    result.to_csv(OUTPUT / "historical_reference.csv", index=False, encoding="utf-8-sig")
+    return result
+
+
+def plot_scenario_comparison(summary_df: pd.DataFrame, name: str) -> None:
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    for scenario, group in summary_df.groupby("scenario", sort=True):
+        ax.plot(group["day"], group[f"{name}_return_pct"], marker="o", label=f"{scenario} ({int(group.iloc[0]['lookback'])} / {int(group.iloc[0]['sample_count'])})")
+    ax.axhline(0, linewidth=0.7, color="gray")
+    ax.set_xticks([1, 3, 5])
+    ax.set_xlabel("Trading days ahead")
+    ax.set_ylabel("Cumulative predicted return (%)")
+    ax.set_title(f"Kronos-base {name}: 4 scenario comparison")
+    ax.grid(alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(OUTPUT / f"{name}_scenario_comparison.png", dpi=160)
+    plt.close(fig)
+
+
+def create_report(summary_df: pd.DataFrame, ref_df: pd.DataFrame, calendar_mode: str) -> None:
+    header = [
+        "# Kronos-base 台灣市場四組對照實驗",
+        "",
+        "此報告屬於單一收盤日的**參數敏感度對照**，不是歷史回測或可交易訊號。",
+        "",
+        f"- 模型：`{MODEL_NAME}`；預測天數：{HORIZON}",
+        f"- 亂數種子基準值：{BASE_SEED}；日期模式：`{calendar_mode}`",
+        "- A=200根/1次抽樣；B=200根/5次；C=400根/1次；D=400根/5次",
+        "- 官方 Kronos 的 sample_count=5 會**先對五條抽樣路徑取平均**，此輸出不包含個別路徑分布。",
+        "- 報表 `REVIEW` 表示超過有限歷史樣本的第99百分位參考範圍；非預測錯誤證明，也非預測機率。",
+        "- TX 為後調整連續合約，不可直接將歷史絕對價位視為可成交報價。",
+        "",
+        "## 四組結果（累積預測漲跌幅）",
+        "",
+        "| 組別 | 日數 | TAIEX % | TX % | 差距（百分點） | 檢查 |",
+        "|---|---:|---:|---:|---:|---|",
+    ]
+    for r in summary_df.itertuples(index=False):
+        header.append(f"| {r.scenario} | {r.day} | {r.TAIEX_return_pct:+.2f} | {r.TX_return_pct:+.2f} | {r.return_gap_pp:+.2f} | {r.review_status} |")
+    header.extend([
+        "", "## 重要限制", "",
+        "1. 無交易日曆時，預測日期暫用平日，未排除台灣休市日。",
+        "2. 分歧與極端報酬門檻是歷史描述統計，不代表模型可信區間。",
+        "3. 固定亂數種子便於比較，但不同硬體、PyTorch 或依賴版本仍可能有差異。",
+        "4. 單日的四組結果不能評估哪個參數最準，必須累積實際結果並做時間序列樣本外回測。",
+        "5. TX 夜盤缺漏與換月仍應核對期交所行情、結算日與交易日曆。",
+        "",
+        "## 歷史參考範圍", "",
+        "| 期間 | 有效樣本數 | 期現貨報酬差絕對值 P99（百分點） | TX 絕對報酬 P99（%） |",
+        "|---|---:|---:|---:|",
+    ])
+    for r in ref_df.itertuples(index=False):
+        header.append(f"| {r.day} 日 | {r.observations} | {r.historical_abs_gap_p99_pp:.3f} | {r.historical_abs_tx_return_p99_pct:.3f} |")
+    (OUTPUT / "experiment_report.md").write_text("\n".join(header)+"\n", encoding="utf-8")
+
+
+def run_experiments(predictor, taiex: pd.DataFrame, tx: pd.DataFrame,
+                    future_dates, calendar_mode: str):
+    reference = historical_reference(taiex, tx)
+    refs = reference.set_index("day")
+    results = []
+    summary_rows = []
+    for scenario, lookback, samples in EXPERIMENTS:
+        predictions = {}
+        for name, frame in (("TAIEX", taiex), ("TX", tx)):
+            pred, result = predict_market(predictor, name, frame, future_dates,
+                                          scenario, lookback, samples)
+            predictions[name] = pred
+            results.append(result)
+        for day in (1, 3, 5):
+            a = float(predictions["TAIEX"]["return_pct"].iloc[day - 1])
+            b = float(predictions["TX"]["return_pct"].iloc[day - 1])
+            gap = b - a
+            reference_row = refs.loc[day]
+            gap_flag = bool(abs(gap) > reference_row["historical_abs_gap_p99_pp"])
+            tail_flag = bool(abs(b) > reference_row["historical_abs_tx_return_p99_pct"])
+            status = "REVIEW" if gap_flag or tail_flag else "OK"
+            summary_rows.append({
+                "scenario": scenario,
+                "lookback": lookback,
+                "sample_count": samples,
+                "day": day,
+                "forecast_date": str(pd.Timestamp(future_dates[day - 1]).date()),
+                "TAIEX_last_close": float(taiex["close"].iloc[-1]),
+                "TAIEX_pred_close": float(predictions["TAIEX"]["close"].iloc[day - 1]),
+                "TAIEX_return_pct": a,
+                "TX_last_close": float(tx["close"].iloc[-1]),
+                "TX_pred_close_adjusted_basis": float(predictions["TX"]["close"].iloc[day - 1]),
+                "TX_return_pct": b,
+                "return_gap_pp": gap,
+                "historical_abs_gap_p99_pp": float(reference_row["historical_abs_gap_p99_pp"]),
+                "historical_abs_tx_return_p99_pct": float(reference_row["historical_abs_tx_return_p99_pct"]),
+                "gap_flag": gap_flag,
+                "tx_tail_flag": tail_flag,
+                "review_status": status,
+            })
+            log(f"[COMPARE] {scenario} D{day}: TAIEX={a:+.2f}%, TX={b:+.2f}%, "
+                f"gap={gap:+.2f}pp -> {status}")
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df.to_csv(OUTPUT / "experiment_summary.csv", index=False, encoding="utf-8-sig")
+    for name in ("TAIEX", "TX"):
+        plot_scenario_comparison(summary_df, name)
+    create_report(summary_df, reference, calendar_mode)
+    return results, {
+        "scenario_count": len(EXPERIMENTS),
+        "market_forecast_runs": len(results),
+        "comparisons": len(summary_df),
+        "review_rows": int((summary_df["review_status"] == "REVIEW").sum()),
+        "report_files": ["experiment_summary.csv", "experiment_report.md",
+                         "historical_reference.csv", "TAIEX_scenario_comparison.png",
+                         "TX_scenario_comparison.png"],
+    }
 
 
 def main() -> None:
@@ -447,18 +624,21 @@ def main() -> None:
         "success": False,
         "created_at_taipei": datetime.now(TZ).isoformat(),
         "model": MODEL_NAME,
-        "lookback": LOOKBACK,
         "horizon": HORIZON,
-        "sample_count": SAMPLE_COUNT,
+        "experiment_config": [
+            {"scenario": s, "lookback": n, "sample_count": m}
+            for s, n, m in EXPERIMENTS
+        ],
+        "base_seed": BASE_SEED,
         "data_source": {"TAIEX": "Yahoo ^TWII", "TX": "FinMind TaiwanFuturesDaily"},
+        "warning": "Four-scenario sensitivity comparison, NOT verified forecast accuracy",
+        "software": {"torch": torch.__version__, "numpy": np.__version__, "pandas": pd.__version__},
     }
     try:
-        if not (1 <= LOOKBACK <= 512):
-            raise ValueError("LOOKBACK must be between 1 and 512 for Kronos-base")
-        if HORIZON < 5:
-            raise ValueError("HORIZON must be >= 5 for day 1/3/5 report")
-        if SAMPLE_COUNT < 1:
-            raise ValueError("SAMPLE_COUNT must be >= 1")
+        if HORIZON != 5:
+            raise ValueError("This version runs exactly 5 forecast trading days")
+        if max(n for _, n, _ in EXPERIMENTS) > 512:
+            raise ValueError("Kronos maximum context is 512 bars")
         if not (0 <= MIN_NIGHT_COVERAGE <= 1):
             raise ValueError("MIN_NIGHT_COVERAGE must be in [0,1]")
 
@@ -477,20 +657,18 @@ def main() -> None:
         status["data_last_date"] = str(taiex.index[-1].date())
 
         log(f"[4/5] Loading {MODEL_NAME} on CPU")
-        device = "cpu"
         tokenizer = KronosTokenizer.from_pretrained(TOKENIZER_NAME)
         model = Kronos.from_pretrained(MODEL_NAME)
         tokenizer.eval()
         model.eval()
-        predictor = KronosPredictor(model, tokenizer, device=device, max_context=512)
+        predictor = KronosPredictor(model, tokenizer, device="cpu", max_context=512)
 
-        log("[5/5] Forecasting both markets")
-        status["results"] = [
-            predict_market(predictor, "TAIEX", taiex, dates),
-            predict_market(predictor, "TX", tx, dates),
-        ]
+        log("[5/5] Running 4 scenarios x 2 markets")
+        status["results"], status["experiment_diagnostics"] = run_experiments(
+            predictor, taiex, tx, dates, calendar_mode
+        )
         status["success"] = True
-        log("[SUCCESS] Both market forecasts complete")
+        log("[SUCCESS] Four-scenario comparison complete")
     except Exception as exc:
         status["error_type"] = type(exc).__name__
         status["error"] = str(exc)
