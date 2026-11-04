@@ -45,6 +45,13 @@ jobs:
           python -c "import torch; print(torch.__version__)"
           python -c "from model import Kronos, KronosTokenizer, KronosPredictor; print('Kronos OK')"
 
+      - name: Verify Kronos module
+        run: |
+          pwd
+          ls -la model/
+          ls -la scripts/
+          python -c "from model import Kronos, KronosTokenizer, KronosPredictor; print('Kronos import OK')"
+          
       - name: Run Taiwan forecast
         env:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
