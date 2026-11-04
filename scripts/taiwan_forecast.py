@@ -57,7 +57,7 @@ MODE = os.getenv(
 ).strip().lower()
 
 BACKTEST_DAYS = int(
-    os.getenv("BACKTEST_DAYS", "20")
+    float(os.getenv("BACKTEST_DAYS", "20"))
 )
 
 BASE_SEED = int(
