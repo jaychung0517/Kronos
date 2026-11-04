@@ -1,12 +1,11 @@
-
 name: Kronos Base - Taiwan Markets
 
 on:
   workflow_dispatch:
 
   schedule:
-    # 16:30 Taiwan time, Monday to Friday
-    - cron: "30 8 * * 1-5"
+    # 09:10 UTC = Taiwan 17:10; allows FinMind post-close update buffer.
+    - cron: "10 9 * * 1-5"
 
 permissions:
   contents: read
@@ -29,41 +28,47 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Validate Python syntax
+        run: |
+          python -m py_compile scripts/taiwan_forecast.py tests/test_taiwan_experiments.py
+
       - name: Install CPU PyTorch
         run: |
           python -m pip install --upgrade pip
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Install Kronos dependencies
         run: |
-          pip install -r requirements.txt
-          pip install yfinance requests matplotlib
+          python -m pip install -r requirements.txt
+          python -m pip install yfinance requests matplotlib
 
-      - name: Verify environment
+      - name: Check imports and environment
         run: |
           python --version
-          python -c "import torch; print(torch.__version__)"
-          python -c "from model import Kronos, KronosTokenizer, KronosPredictor; print('Kronos OK')"
-
-      - name: Verify Kronos module
-        run: |
-          pwd
-          ls -la model/
-          ls -la scripts/
+          python -c "import torch; print('Torch:', torch.__version__)"
           python -c "from model import Kronos, KronosTokenizer, KronosPredictor; print('Kronos import OK')"
-          
-      - name: Run Taiwan forecast
+
+      - name: Run offline unit tests
+        run: |
+          python -m unittest discover -s tests -p 'test_taiwan_experiments.py' -v
+
+      - name: Run Taiwan 4-scenario forecast
         env:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          KRONOS_MODEL: NeoQuasar/Kronos-base
+          KRONOS_SEED: "20261104"
           OMP_NUM_THREADS: "2"
+          PYTHONUNBUFFERED: "1"
+          # Set to "1" only when data/trading_calendar.csv is maintained.
+          STRICT_TRADING_CALENDAR: "0"
         run: |
           python -m scripts.taiwan_forecast
-  
-      - name: Upload results
+
+      - name: Upload all results even if prediction failed
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kronos-taiwan-results
+          name: kronos-taiwan-v2-results
           path: outputs/
           if-no-files-found: warn
           retention-days: 30
