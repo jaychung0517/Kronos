@@ -50,8 +50,8 @@ jobs:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
           OMP_NUM_THREADS: "2"
         run: |
-          python scripts/taiwan_forecast.py
-
+          python -m scripts.taiwan_forecast
+  
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
