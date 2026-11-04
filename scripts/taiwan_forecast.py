@@ -1343,6 +1343,12 @@ def backtest_summary(detail):
             "lookback": int(g.lookback.iloc[0]),
             "samples": int(g.samples.iloc[0]),
             "n": len(g),
+            "ohlc_valid_rate": float(
+                 g["prediction_ohlc_valid"].mean()
+            ),
+            "full_path_valid_rate": float(
+                g["forecast_path_ohlc_valid"].mean()
+            ),
             "direction_accuracy": direction_accuracy,
             "mae_pp": float(error.abs().mean()),
             "rmse_pp": float(
@@ -1521,6 +1527,12 @@ def run_backtest(
                         "samples": samples,
                         "horizon": h,
                         "random_seed": seed,
+                        "prediction_ohlc_valid": bool(
+                            p["ohlc_valid"].iloc[h - 1]
+                        ),
+                        "forecast_path_ohlc_valid": bool(
+                            p["ohlc_valid"].all()
+                        ),
                         "pred_return_pct": float(
                             p.return_pct.iloc[h-1]
                         ),
