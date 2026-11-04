@@ -797,6 +797,7 @@ def experiment_seed(market, origin):
 # 9. Kronos AI 預測
 # ============================================================
 
+
 def predict(
     predictor,
     history,
@@ -804,6 +805,25 @@ def predict(
     sample_count,
     seed
 ):
+    """
+    Kronos V3.1 prediction.
+
+    Historical OHLC: strict validation.
+    Predicted OHLC: preserve raw values and flag violations.
+    Closing-price backtest may continue if close is valid.
+    """
+
+    # 1. Check historical input
+    validate_ohlc(
+        history,
+        "Historical input"
+    )
+
+    if len(future_dates) != HORIZON:
+        raise ValueError(
+            f"Expected {HORIZON} future dates"
+        )
+
     seed_everything(seed)
 
     x_dates = pd.Series(
@@ -814,6 +834,7 @@ def predict(
         pd.DatetimeIndex(future_dates)
     ).reset_index(drop=True)
 
+    # 2. Run Kronos
     with torch.inference_mode():
         result = predictor.predict(
             df=history[OHLC].reset_index(
@@ -837,31 +858,126 @@ def predict(
             "forecast shape"
         )
 
-    result = result[
-        OHLC
-    ].copy().reset_index(drop=True)
+    if not set(OHLC).issubset(result.columns):
+        raise RuntimeError(
+            "Kronos forecast missing OHLC columns"
+        )
 
-    validate_ohlc(
-        result,
-        "Kronos forecast"
+    result = (
+        result[OHLC]
+        .copy()
+        .reset_index(drop=True)
     )
 
+    for column in OHLC:
+        result[column] = pd.to_numeric(
+            result[column],
+            errors="coerce"
+        )
+
+    # 3. Closing price must be finite and positive
+    close_array = result[
+        "close"
+    ].to_numpy(dtype=float)
+
+    if (
+        not np.isfinite(close_array).all()
+        or (close_array <= 0).any()
+    ):
+        raise RuntimeError(
+            "Kronos predicted close is invalid; "
+            "cannot calculate return"
+        )
+
+    # 4. Diagnose raw predicted OHLC
+    price_array = result[
+        OHLC
+    ].to_numpy(dtype=float)
+
+    finite_positive = (
+        np.isfinite(price_array).all(axis=1)
+        & (price_array > 0).all(axis=1)
+    )
+
+    # Allow tiny floating-point rounding differences
+    tolerance = (
+        result["close"].abs() * 0.000001
+    ).clip(lower=0.01)
+
+    expected_high_min = result[
+        ["open", "low", "close"]
+    ].max(axis=1)
+
+    expected_low_max = result[
+        ["open", "high", "close"]
+    ].min(axis=1)
+
+    high_valid = (
+        result["high"] + tolerance
+        >= expected_high_min
+    )
+
+    low_valid = (
+        result["low"] - tolerance
+        <= expected_low_max
+    )
+
+    ohlc_valid = (
+        finite_positive
+        & high_valid.to_numpy(dtype=bool)
+        & low_valid.to_numpy(dtype=bool)
+    )
+
+    result["ohlc_valid"] = ohlc_valid
+
+    # 5. Record invalid candles without modifying prices
+    invalid_count = int(
+        (~result["ohlc_valid"]).sum()
+    )
+
+    if invalid_count > 0:
+        log(
+            "[PREDICTION QUALITY WARNING] "
+            f"origin={history.index[-1].date()}, "
+            f"samples={sample_count}, "
+            f"seed={seed}, "
+            f"invalid_ohlc={invalid_count}/{HORIZON}"
+        )
+
+        examples = result.loc[
+            ~result["ohlc_valid"],
+            OHLC
+        ].head(3)
+
+        log(
+            "[INVALID OHLC EXAMPLES] "
+            + str(
+                examples.round(2).to_dict("records")
+            )
+        )
+
+    # 6. Assign future dates
     result.index = pd.DatetimeIndex(
         future_dates
     )
 
     result.index.name = "date"
 
+    # 7. Calculate forecast close-to-close returns
     reference = float(
-        history.close.iloc[-1]
+        history["close"].iloc[-1]
     )
 
     result["return_pct"] = (
         100.0
-        * (result.close / reference - 1.0)
+        * (
+            result["close"] / reference
+            - 1.0
+        )
     )
 
     return result
+
 
 
 # ============================================================
