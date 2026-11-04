@@ -1,10 +1,26 @@
+
 name: Kronos Base - Taiwan Markets
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "Select execution mode"
+        required: true
+        type: choice
+        default: live
+        options:
+          - live
+          - backtest
+
+      backtest_days:
+        description: "Backtest origins (start with 20, max 100)"
+        required: true
+        type: number
+        default: 20
 
   schedule:
-    # 09:10 UTC = Taiwan 17:10; allows FinMind post-close update buffer.
+    # UTC 09:10 = Taiwan 17:10
     - cron: "10 9 * * 1-5"
 
 permissions:
@@ -17,7 +33,7 @@ concurrency:
 jobs:
   forecast:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
@@ -30,45 +46,51 @@ jobs:
 
       - name: Validate Python syntax
         run: |
-          python -m py_compile scripts/taiwan_forecast.py tests/test_taiwan_experiments.py
+          python -m py_compile scripts/taiwan_forecast.py
+          python -m py_compile tests/test_taiwan_experiments.py
 
       - name: Install CPU PyTorch
         run: |
           python -m pip install --upgrade pip
-          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install torch \
+            --index-url https://download.pytorch.org/whl/cpu
 
       - name: Install Kronos dependencies
         run: |
           python -m pip install -r requirements.txt
           python -m pip install yfinance requests matplotlib
 
-      - name: Check imports and environment
+      - name: Verify environment
         run: |
           python --version
-          python -c "import torch; print('Torch:', torch.__version__)"
-          python -c "from model import Kronos, KronosTokenizer, KronosPredictor; print('Kronos import OK')"
+          python -c "import torch; print(torch.__version__)"
+          python -c "from model import Kronos, KronosTokenizer, KronosPredictor; print('Kronos OK')"
 
-      - name: Run offline unit tests
+      - name: Run offline tests
         run: |
-          python -m unittest discover -s tests -p 'test_taiwan_experiments.py' -v
+          python -m unittest discover \
+            -s tests \
+            -p 'test_taiwan_experiments.py' \
+            -v
 
-      - name: Run Taiwan 4-scenario forecast
+      - name: Run Kronos V3
         env:
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
           KRONOS_MODEL: NeoQuasar/Kronos-base
+          KRONOS_MODE: ${{ inputs.mode || 'live' }}
+          BACKTEST_DAYS: ${{ inputs.backtest_days || '20' }}
           KRONOS_SEED: "20261104"
           OMP_NUM_THREADS: "2"
           PYTHONUNBUFFERED: "1"
-          # Set to "1" only when data/trading_calendar.csv is maintained.
           STRICT_TRADING_CALENDAR: "0"
         run: |
           python -m scripts.taiwan_forecast
 
-      - name: Upload all results even if prediction failed
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kronos-taiwan-v2-results
+          name: kronos-taiwan-v3-results
           path: outputs/
           if-no-files-found: warn
           retention-days: 30
