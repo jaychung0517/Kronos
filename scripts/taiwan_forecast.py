@@ -230,6 +230,81 @@ def fetch_taiex():
             df.index = df.index.normalize()
             df = df.sort_index()
 
+            # Yahoo 長期間日 K 偶爾缺少最近交易日。
+            # 另外下載近一個月，補齊並更新最新的有效 K 棒。
+            try:
+                recent = yf.download(
+                    "^TWII",
+                    period="1mo",
+                    interval="1d",
+                    auto_adjust=False,
+                    progress=False,
+                    multi_level_index=False,
+                    threads=False
+                )
+
+                if recent is not None and not recent.empty:
+                    if isinstance(recent.columns, pd.MultiIndex):
+                        recent.columns = (
+                            recent.columns.get_level_values(0)
+                        )
+
+                    recent = recent.rename(columns={
+                        "Open": "open",
+                        "High": "high",
+                        "Low": "low",
+                        "Close": "close"
+                    })
+
+                    recent = (
+                        recent[OHLC]
+                        .apply(pd.to_numeric, errors="coerce")
+                        .dropna()
+                    )
+
+                    recent.index = pd.DatetimeIndex(recent.index)
+
+                    if recent.index.tz is not None:
+                        recent.index = (
+                            recent.index
+                            .tz_convert(TZ)
+                            .tz_localize(None)
+                        )
+
+                    recent.index = recent.index.normalize()
+
+                    # 台股當日尚未完成時，不使用當日未完成日 K
+                    now_tw = datetime.now(TZ)
+                    if now_tw.hour < 14:
+                        recent = recent.loc[
+                            recent.index < pd.Timestamp(now_tw.date())
+                        ]
+
+                    if not recent.empty:
+                        valid = (
+                            (recent[OHLC] > 0).all(axis=1)
+                            & (recent["high"] >= recent[OHLC].max(axis=1))
+                            & (recent["low"] <= recent[OHLC].min(axis=1))
+                        )
+
+                        recent = recent.loc[valid]
+
+                        if not recent.empty:
+                            df = pd.concat([df, recent])
+                            df = df[
+                                ~df.index.duplicated(keep="last")
+                            ].sort_index()
+
+                    log(
+                        f"[TAIEX] recent refresh; "
+                        f"latest={df.index[-1].date()}"
+                    )
+
+            except Exception as exc:
+                log(
+                    f"[TAIEX] recent refresh warning: {exc}"
+                )
+
             if (
                 df.index.has_duplicates
                 or len(df) < 410
