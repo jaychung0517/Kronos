@@ -1,29 +1,34 @@
-
 name: Kronos Base - Taiwan Markets
 
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: "Execution mode"
+      session:
+        description: "Which daily session to run"
         required: true
         type: choice
-        default: backtest
+        default: tw_close
+        options:
+          - tw_close
+          - us_close
+      mode:
+        description: "Live or historical Taiwan backtest"
+        required: true
+        type: choice
+        default: live
         options:
           - live
           - backtest
-
       scenarios:
-        description: "Model scenarios"
+        description: "Taiwan model scenarios"
         required: true
         type: choice
         default: AB
         options:
           - AB
           - ABCD
-
       seed_count:
-        description: "Random seeds (live uses first seed)"
+        description: "Taiwan backtest seeds (US-close always 3)"
         required: true
         type: choice
         default: "3"
@@ -31,7 +36,6 @@ on:
           - "1"
           - "3"
           - "5"
-
       backtest_days:
         description: "Historical backtest origins (1-100)"
         required: true
@@ -39,20 +43,29 @@ on:
         default: 20
 
   schedule:
-    # UTC 09:10 = Taiwan 17:10
+    # Taiwan Monday-Friday 17:10 (UTC Monday-Friday 09:10)
     - cron: "10 9 * * 1-5"
+    # Taiwan Tuesday-Saturday 06:20 (UTC Monday-Friday 22:20)
+    # Same hour year-round despite US daylight saving time.
+    - cron: "20 22 * * 1-5"
 
 permissions:
   contents: read
+  actions: read  # Fetch the latest finished Taiwan-close report for US-close comparison
 
 concurrency:
-  group: kronos-taiwan
+  group: kronos-${{ github.event_name == 'schedule' && github.event.schedule == '20 22 * * 1-5' && 'us-close' || 'tw-close' }}
   cancel-in-progress: false
 
 jobs:
   forecast:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      KRONOS_SESSION: ${{ (github.event_name == 'schedule' && github.event.schedule == '20 22 * * 1-5') && 'us_close' || (github.event_name == 'workflow_dispatch' && inputs.session == 'us_close' && inputs.mode == 'live') && 'us_close' || 'tw_close' }}
+      KRONOS_MODE: ${{ github.event_name == 'schedule' && 'live' || inputs.mode || 'live' }}
+      OMP_NUM_THREADS: "2"
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout repository
@@ -66,6 +79,8 @@ jobs:
       - name: Validate Python syntax
         run: |
           python -m py_compile scripts/taiwan_forecast.py
+          python -m py_compile scripts/us_close_forecast.py
+          python -m py_compile scripts/kronos_daily_report.py
           python -m py_compile tests/test_taiwan_experiments.py
 
       - name: Install CPU PyTorch
@@ -77,7 +92,7 @@ jobs:
       - name: Install Kronos dependencies
         run: |
           python -m pip install -r requirements.txt
-          python -m pip install yfinance requests matplotlib
+          python -m pip install yfinance requests matplotlib pandas_market_calendars
 
       - name: Verify environment
         run: |
@@ -92,31 +107,36 @@ jobs:
             -p 'test_taiwan_experiments.py' \
             -v
 
-      - name: Run Kronos V3.2
-        env:
-          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
-          KRONOS_MODEL: NeoQuasar/Kronos-base
-          KRONOS_MODE: ${{ github.event_name == 'schedule' && 'live' || inputs.mode || 'live' }}
-          KRONOS_SCENARIOS: ${{ inputs.scenarios || 'AB' }}
-          KRONOS_SEED_COUNT: ${{ github.event_name == 'schedule' && '1' || inputs.seed_count || '1' }}
-          BACKTEST_DAYS: ${{ inputs.backtest_days || '20' }}
-          KRONOS_SEED: "20261104"
-          MAX_BACKTEST_CALLS: "2500"
-          OMP_NUM_THREADS: "2"
-          PYTHONUNBUFFERED: "1"
-          STRICT_TRADING_CALENDAR: "0"
-        run: |
-          python -m scripts.taiwan_forecast
-
-
       - name: Install Chinese report fonts
-        if: ${{ github.event_name == 'schedule' || inputs.mode == 'live' }}
+        if: ${{ env.KRONOS_MODE == 'live' }}
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y fonts-noto-cjk
 
-      - name: Build and send daily report
-        if: ${{ success() && (github.event_name == 'schedule' || inputs.mode == 'live') }}
+      - name: Run Kronos V3.3 Taiwan or V3.4 US close
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REPORT_TELEGRAM: "1"
+          KRONOS_MODEL: NeoQuasar/Kronos-base
+          KRONOS_SCENARIOS: ${{ inputs.scenarios || 'AB' }}
+          KRONOS_SEED_COUNT: ${{ github.event_name == 'schedule' && '1' || inputs.seed_count || '1' }}
+          V33_LIVE_SEEDS: "3"
+          BACKTEST_DAYS: ${{ inputs.backtest_days || '20' }}
+          KRONOS_SEED: "20261104"
+          MAX_BACKTEST_CALLS: "2500"
+          STRICT_TRADING_CALENDAR: "0"
+        run: |
+          if [[ "${KRONOS_SESSION}" == "us_close" && "${KRONOS_MODE}" == "live" ]]; then
+            python -m scripts.us_close_forecast
+          else
+            python -m scripts.taiwan_forecast
+          fi
+
+      - name: Build and send Taiwan-close report
+        if: ${{ success() && env.KRONOS_SESSION == 'tw_close' && env.KRONOS_MODE == 'live' }}
         continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -129,7 +149,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kronos-taiwan-v3-results
+          name: ${{ env.KRONOS_SESSION == 'us_close' && 'kronos-us-close-results' || 'kronos-taiwan-v3-results' }}
           path: outputs/
           if-no-files-found: warn
           retention-days: 30
