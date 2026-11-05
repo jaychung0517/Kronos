@@ -2200,7 +2200,7 @@ def main():
 
     status = {
         "success": False,
-        "version": "V3.2",
+        "version": "V3.3",
         "mode": MODE,
         "model": MODEL_NAME,
         "created_at_taipei":
@@ -2343,6 +2343,13 @@ def main():
                 scenarios
             )
 
+            status["reversal_v33"] = v33_live_reversal(
+                predictor,
+                taiex.tail(400),
+                tx,
+                future_dates
+            )
+
         # 歷史回測
         else:
             status["backtest"] = run_backtest(
@@ -2351,6 +2358,11 @@ def main():
                 combined,
                 BACKTEST_DAYS,
                 scenarios
+            )
+
+            status["reversal_v33"] = v33_backtest_reversal(
+                taiex,
+                combined
             )
 
         status["success"] = True
@@ -2386,6 +2398,790 @@ def main():
             status
         )
 
+
+# ============================================================
+# Kronos-base V3.3
+# High / low reversal observation and research
+# ============================================================
+
+def v33_price_features(frame):
+    """Calculate price regime using only available historical data."""
+
+    close = frame["close"].astype(float).sort_index()
+
+    if len(close) < 25:
+        raise ValueError("V3.3 requires at least 25 bars")
+
+    last = float(close.iloc[-1])
+
+    r1 = (
+        last / float(close.iloc[-2]) - 1
+    ) * 100
+
+    r5 = (
+        last / float(close.iloc[-6]) - 1
+    ) * 100
+
+    ma5 = float(close.tail(5).mean())
+    ma20 = float(close.tail(20).mean())
+
+    high20 = float(close.tail(20).max())
+    low20 = float(close.tail(20).min())
+
+    # High-price zone: exploratory thresholds
+    top_watch = (
+        last >= high20 * 0.985
+        and r5 >= 2.0
+    )
+
+    # Sharp-drop zone: exploratory thresholds
+    bottom_watch = (
+        last <= low20 * 1.03
+        and r5 <= -5.0
+    )
+
+    top_confirmed = (
+        top_watch
+        and r1 < 0
+        and last < ma5
+    )
+
+    bottom_confirmed = (
+        bottom_watch
+        and r1 > 0
+        and last > ma5
+    )
+
+    if top_confirmed:
+        state = "TOP_CONFIRMED"
+    elif bottom_confirmed:
+        state = "BOTTOM_CONFIRMED"
+    elif top_watch:
+        state = "TOP_WATCH"
+    elif bottom_watch:
+        state = "BOTTOM_WATCH"
+    elif last >= ma20:
+        state = "TREND_UP"
+    else:
+        state = "TREND_DOWN_OR_RANGE"
+
+    return {
+        "state": state,
+        "top_watch": bool(top_watch),
+        "top_confirmed": bool(top_confirmed),
+        "bottom_watch": bool(bottom_watch),
+        "bottom_confirmed": bool(bottom_confirmed),
+        "close": last,
+        "return_1d_pct": r1,
+        "return_5d_pct": r5,
+        "distance_from_20d_high_pct":
+            (last / high20 - 1) * 100,
+        "distance_from_20d_low_pct":
+            (last / low20 - 1) * 100,
+        "above_ma20": bool(last > ma20),
+    }
+
+
+def v33_ai_votes(
+    three_day_returns,
+    one_day_returns,
+    five_day_returns
+):
+    """
+    Compare multiple independent random seeds.
+
+    Seed agreement is not a calibrated probability.
+    """
+
+    r3 = np.asarray(
+        three_day_returns, dtype=float
+    )
+
+    r1 = np.asarray(
+        one_day_returns, dtype=float
+    )
+
+    r5 = np.asarray(
+        five_day_returns, dtype=float
+    )
+
+    valid = (
+        np.isfinite(r1)
+        & np.isfinite(r3)
+        & np.isfinite(r5)
+    )
+
+    r1 = r1[valid]
+    r3 = r3[valid]
+    r5 = r5[valid]
+
+    n = len(r3)
+
+    if n == 0:
+        return {
+            "valid_seeds": 0,
+            "up_votes_3d": 0,
+            "down_votes_3d": 0,
+            "ai_top_support": False,
+            "ai_bottom_support": False,
+            "ai_recovery_hint": False,
+            "forecast_3d_pct": None,
+            "forecast_5d_pct": None,
+            "forecast_path_slope_pp": None,
+        }
+
+    up_votes = int((r3 > 0).sum())
+    down_votes = int((r3 < 0).sum())
+
+    quorum = max(
+        2,
+        (2 * n + 2) // 3
+    )
+
+    # This compares D5 with D1 within
+    # the same forecast, not across dates.
+    slope = float(
+        np.median(r5 - r1)
+    )
+
+    return {
+        "valid_seeds": n,
+        "up_votes_3d": up_votes,
+        "down_votes_3d": down_votes,
+        "ai_top_support":
+            bool(down_votes >= quorum),
+        "ai_bottom_support":
+            bool(up_votes >= quorum),
+        "ai_recovery_hint":
+            bool(slope >= 2.0),
+        "forecast_3d_pct":
+            float(r3.mean()),
+        "forecast_5d_pct":
+            float(r5.mean()),
+        "forecast_path_slope_pp": slope,
+    }
+
+
+def v33_combine(price, ai):
+    """
+    Price condition is primary.
+    AI direction alone never creates a trade.
+    """
+
+    if price["top_watch"]:
+
+        signal = (
+            "TOP_CONFIRM"
+            if price["top_confirmed"]
+            else "TOP_WATCH"
+        )
+
+        note = (
+            "Review exits and protective stops; "
+            "do not sell solely on AI direction."
+        )
+
+    elif price["bottom_watch"]:
+
+        signal = (
+            "BOTTOM_CONFIRM"
+            if price["bottom_confirmed"]
+            else "BOTTOM_WATCH"
+        )
+
+        note = (
+            "Observe stabilization; "
+            "any test position needs risk limits."
+        )
+
+    else:
+
+        signal = price["state"]
+
+        note = (
+            "No price reversal setup; "
+            "do not force a trade."
+        )
+
+    return {
+        "signal": signal,
+
+        "ai_confirmed_top": bool(
+            price["top_watch"]
+            and ai["ai_top_support"]
+        ),
+
+        "ai_confirmed_bottom": bool(
+            price["bottom_watch"]
+            and ai["ai_bottom_support"]
+        ),
+
+        "ai_recovery_observation": bool(
+            price["bottom_watch"]
+            and ai["ai_recovery_hint"]
+        ),
+
+        "action_note": note,
+    }
+
+
+def v33_find_turning_day(path_pct):
+    """
+    Find a local extremum within the five-day
+    forecast path. This is not a verified turn.
+    """
+
+    values = np.asarray(
+        path_pct, dtype=float
+    )
+
+    if (
+        len(values) != HORIZON
+        or not np.isfinite(values).all()
+    ):
+        return None, "NONE"
+
+    peak = int(np.argmax(values))
+    trough = int(np.argmin(values))
+
+    if (
+        0 < peak < len(values) - 1
+        and values[-1] <= values[peak] - 1
+    ):
+        return (
+            peak + 1,
+            "TOP_IN_FORECAST_PATH"
+        )
+
+    if (
+        0 < trough < len(values) - 1
+        and values[-1] >= values[trough] + 1
+    ):
+        return (
+            trough + 1,
+            "BOTTOM_IN_FORECAST_PATH"
+        )
+
+    return None, "NONE"
+
+
+def v33_live_reversal(
+    predictor,
+    taiex,
+    tx,
+    future_dates
+):
+    """
+    Daily V3.3 observation.
+
+    Use B scenario (200 bars / 5 samples)
+    and 3 independent seeds by default.
+    """
+
+    n_seeds = int(
+        os.getenv("V33_LIVE_SEEDS", "3")
+    )
+
+    if n_seeds not in (3, 5):
+        raise ValueError(
+            "V33_LIVE_SEEDS must be 3 or 5"
+        )
+
+    rows = []
+    seed_rows = []
+
+    for market, frame in (
+        ("TAIEX", taiex),
+        ("TX", tx)
+    ):
+        history = frame.tail(200)
+
+        price = v33_price_features(frame)
+
+        r1 = []
+        r3 = []
+        r5 = []
+        all_paths = []
+
+        for seed_index in range(n_seeds):
+
+            # Reuse the B/seed0 output when
+            # the existing live run created it.
+            saved_path = (
+                OUTPUT
+                / f"{market}_B_forecast.csv"
+            )
+
+            if (
+                seed_index == 0
+                and saved_path.exists()
+            ):
+                forecast = pd.read_csv(
+                    saved_path,
+                    index_col=0,
+                    parse_dates=True
+                )
+
+                forecast = forecast.loc[
+                    :,
+                    [
+                        "close",
+                        "return_pct",
+                        "ohlc_valid"
+                    ]
+                ]
+
+                forecast["ohlc_valid"] = (
+                    forecast["ohlc_valid"]
+                    .astype(str)
+                    .str.lower()
+                    .eq("true")
+                )
+
+                if len(forecast) != HORIZON:
+                    raise ValueError(
+                        f"Invalid saved forecast: {market}"
+                    )
+
+            else:
+                seed = experiment_seed(
+                    market,
+                    frame.index[-1],
+                    seed_index
+                )
+
+                forecast = predict(
+                    predictor,
+                    history,
+                    future_dates,
+                    5,
+                    seed
+                )
+
+            path = (
+                forecast["return_pct"]
+                .astype(float)
+                .to_numpy()
+            )
+
+            all_paths.append(path)
+
+            r1.append(float(path[0]))
+            r3.append(float(path[2]))
+            r5.append(float(path[4]))
+
+            for day, (
+                target_date, record
+            ) in enumerate(
+                forecast.iterrows(),
+                start=1
+            ):
+                seed_rows.append({
+                    "market": market,
+                    "seed_index": seed_index,
+                    "origin": str(
+                        frame.index[-1].date()
+                    ),
+                    "horizon": day,
+                    "target_date": str(
+                        pd.Timestamp(
+                            target_date
+                        ).date()
+                    ),
+                    "pred_close": float(
+                        record["close"]
+                    ),
+                    "pred_return_pct": float(
+                        record["return_pct"]
+                    ),
+                    "ohlc_valid": bool(
+                        record["ohlc_valid"]
+                    ),
+                })
+
+        ai = v33_ai_votes(
+            r3, r1, r5
+        )
+
+        median_path = np.median(
+            np.stack(all_paths, axis=0),
+            axis=0
+        )
+
+        turning_day, turning_type = (
+            v33_find_turning_day(
+                median_path
+            )
+        )
+
+        decision = v33_combine(
+            price, ai
+        )
+
+        rows.append({
+            "market": market,
+            "origin": str(
+                frame.index[-1].date()
+            ),
+            **price,
+            **ai,
+            "predicted_turning_day":
+                turning_day,
+            "predicted_turning_type":
+                turning_type,
+            **decision,
+        })
+
+    pd.DataFrame(rows).to_csv(
+        OUTPUT / "v33_reversal_live.csv",
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    pd.DataFrame(seed_rows).to_csv(
+        OUTPUT / "v33_seed_paths.csv",
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    report = [
+        "# Kronos-base V3.3 反轉觀察",
+        "",
+        "價格條件是主要訊號；",
+        "AI 僅作輔助，尚未完成偏空校準。",
+        "",
+        "| 市場 | 價格狀態 | AI三日偏空票 | "
+        "AI三日偏多票 | AI高檔支持 | AI低檔支持 |",
+        "|---|---|---:|---:|---|---|",
+    ]
+
+    for x in rows:
+        report.append(
+            f"| {x['market']} | "
+            f"{x['signal']} | "
+            f"{x['down_votes_3d']}/"
+            f"{x['valid_seeds']} | "
+            f"{x['up_votes_3d']}/"
+            f"{x['valid_seeds']} | "
+            f"{x['ai_confirmed_top']} | "
+            f"{x['ai_confirmed_bottom']} |"
+        )
+
+    report += [
+        "",
+        "## 重要限制",
+        "",
+        "AI 多種子一致不代表機率。",
+        "反轉觀察不是自動買賣指令。",
+        "預測路徑轉折日不是已確認的市場轉折。",
+        "未配置正式交易日曆時，"
+        "預測日期可能包含台灣休市日。",
+    ]
+
+    (
+        OUTPUT / "v33_reversal_report.md"
+    ).write_text(
+        "\n".join(report) + "\n",
+        encoding="utf-8"
+    )
+
+    return {
+        "markets": len(rows),
+        "seed_count": n_seeds,
+        "price_states": {
+            r["market"]: r["signal"]
+            for r in rows
+        },
+    }
+
+
+def v33_backtest_reversal(
+    taiex,
+    combined
+):
+    """
+    Reanalyze the completed backtest_detail.csv.
+
+    Signal conditions only use information
+    available at each historical origin.
+
+    Future returns are used only for evaluation.
+    """
+
+    path = OUTPUT / "backtest_detail.csv"
+
+    if not path.exists():
+        raise RuntimeError(
+            "Missing backtest_detail.csv"
+        )
+
+    detail = pd.read_csv(
+        path,
+        dtype={
+            "origin": str,
+            "target_date": str
+        }
+    )
+
+    b = detail[
+        detail["scenario"] == "B"
+    ].copy()
+
+    if b.empty:
+        log(
+            "[V3.3] B scenario unavailable; "
+            "reversal analysis skipped"
+        )
+
+        return {
+            "skipped": "B scenario unavailable"
+        }
+
+    selected = select_front_contract(
+        combined
+    )
+
+    event_rows = []
+
+    for (
+        market, origin_text
+    ), records in b.groupby(
+        ["market", "origin"],
+        sort=True
+    ):
+        origin = pd.Timestamp(
+            origin_text
+        )
+
+        if market == "TAIEX":
+            history = (
+                taiex.loc[:origin]
+                .tail(200)
+            )
+        else:
+            history, _, _, _ = tx_asof(
+                combined,
+                selected,
+                origin,
+                200
+            )
+
+        price = v33_price_features(
+            history
+        )
+
+        pivot = records.pivot_table(
+            index="seed_index",
+            columns="horizon",
+            values="pred_return_pct",
+            aggfunc="first"
+        )
+
+        for h in (1, 3, 5):
+            if h not in pivot.columns:
+                pivot[h] = np.nan
+
+        pivot = pivot[
+            [1, 3, 5]
+        ].dropna()
+
+        ai = v33_ai_votes(
+            pivot[3],
+            pivot[1],
+            pivot[5]
+        )
+
+        actual3 = float(
+            records.loc[
+                records["horizon"] == 3,
+                "actual_return_pct"
+            ].iloc[0]
+        )
+
+        actual5 = float(
+            records.loc[
+                records["horizon"] == 5,
+                "actual_return_pct"
+            ].iloc[0]
+        )
+
+        decision = v33_combine(
+            price, ai
+        )
+
+        event_rows.append({
+            "origin": origin_text,
+            "market": market,
+            **price,
+            **ai,
+            **decision,
+            "actual_3d_pct": actual3,
+            "actual_5d_pct": actual5,
+            "top_outcome_down_2pct_3d":
+                bool(actual3 <= -2.0),
+            "bottom_outcome_up_2pct_5d":
+                bool(actual5 >= 2.0),
+        })
+
+    events = pd.DataFrame(
+        event_rows
+    ).sort_values(
+        ["market", "origin"]
+    )
+
+    events.to_csv(
+        OUTPUT / "v33_reversal_backtest_events.csv",
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    summary_rows = []
+
+    for market, frame in events.groupby(
+        "market"
+    ):
+        configurations = [
+            (
+                "HIGH_TO_DOWN",
+                "top_watch",
+                "ai_confirmed_top",
+                "top_outcome_down_2pct_3d"
+            ),
+            (
+                "CRASH_TO_UP",
+                "bottom_watch",
+                "ai_confirmed_bottom",
+                "bottom_outcome_up_2pct_5d"
+            ),
+        ]
+
+        for (
+            event_type,
+            price_column,
+            ai_column,
+            outcome_column
+        ) in configurations:
+
+            for method, signal in [
+                (
+                    "PRICE_ONLY",
+                    frame[price_column]
+                ),
+                (
+                    "PRICE_AND_AI",
+                    frame[ai_column]
+                ),
+            ]:
+                correct = int(
+                    (
+                        signal
+                        & frame[outcome_column]
+                    ).sum()
+                )
+
+                incorrect = int(
+                    (
+                        signal
+                        & ~frame[outcome_column]
+                    ).sum()
+                )
+
+                total = correct + incorrect
+
+                summary_rows.append({
+                    "market": market,
+                    "event": event_type,
+                    "method": method,
+                    "all_origins": len(frame),
+                    "signals": total,
+                    "true_positive": correct,
+                    "false_positive": incorrect,
+                    "precision": (
+                        correct / total
+                        if total else np.nan
+                    ),
+                    "signal_coverage": (
+                        total / len(frame)
+                    ),
+                })
+
+    summary = pd.DataFrame(
+        summary_rows
+    )
+
+    summary.to_csv(
+        OUTPUT / "v33_reversal_backtest_summary.csv",
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    lines = [
+        "# Kronos-base V3.3 反轉事件回測",
+        "",
+        "## 事先定義的探索性條件",
+        "",
+        "高檔：距20日最高收盤1.5%內，"
+        "且過去5日上漲至少2%。",
+        "",
+        "急跌：過去5日下跌至少5%，"
+        "且距20日最低收盤3%內。",
+        "",
+        "高檔事後評估：未來3日下跌至少2%。",
+        "",
+        "急跌事後評估：未來5日上漲至少2%。",
+        "",
+        "以上為報酬事件，並非真正最高點"
+        "或最低點的精確標記。",
+        "",
+        "| 市場 | 事件 | 方法 | 訊號 | "
+        "命中 | 誤報 | 命中率 |",
+        "|---|---|---|---:|---:|---:|---:|",
+    ]
+
+    for r in summary.itertuples(
+        index=False
+    ):
+        accuracy = (
+            f"{r.precision:.1%}"
+            if pd.notna(r.precision)
+            else "無訊號"
+        )
+
+        lines.append(
+            f"| {r.market} | {r.event} | "
+            f"{r.method} | {r.signals} | "
+            f"{r.true_positive} | "
+            f"{r.false_positive} | "
+            f"{accuracy} |"
+        )
+
+    lines += [
+        "",
+        "## 注意事項",
+        "",
+        "本次為探索性歷史分析，"
+        "觀察日期可能高度重疊。",
+        "",
+        "如果 AI+價格和純價格結果相同，"
+        "代表 AI 尚未展現額外篩選能力。",
+        "",
+        "不能用同一批資料挑選最優門檻，"
+        "再宣稱具有樣本外預測優勢。",
+    ]
+
+    (
+        OUTPUT / "v33_reversal_backtest_report.md"
+    ).write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8"
+    )
+
+    return {
+        "origin_market_rows": len(events),
+        "summary_rows": len(summary),
+        "report":
+            "v33_reversal_backtest_report.md",
+    }
 
 if __name__ == "__main__":
     main()
