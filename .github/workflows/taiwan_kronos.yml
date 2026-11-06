@@ -92,7 +92,7 @@ jobs:
       - name: Install Kronos dependencies
         run: |
           python -m pip install -r requirements.txt
-          python -m pip install yfinance requests matplotlib pandas_market_calendars
+          python -m pip install yfinance requests matplotlib pandas_market_calendars beautifulsoup4
 
       - name: Verify environment
         run: |
