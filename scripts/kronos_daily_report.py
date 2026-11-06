@@ -34,16 +34,33 @@ STATUS_ZH = {
     "TREND_DOWN_OR_RANGE": "下跌或區間整理",
 }
 
+
 def setup_chinese_font():
-    preferred = ("Noto Sans CJK TC", "Noto Sans CJK SC", "Noto Sans CJK JP", "Microsoft JhengHei")
-    installed = {f.name for f in font_manager.fontManager.ttflist}
-    for name in preferred:
-        if name in installed:
+    candidates = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    ]
+
+    for filename in candidates:
+        if Path(filename).exists():
+            font_manager.fontManager.addfont(filename)
+            name = font_manager.FontProperties(
+                fname=filename
+            ).get_name()
+
             plt.rcParams["font.family"] = name
-            break
-    else:
-        print("[REPORT] WARNING: CJK font not found; Chinese may display as boxes", flush=True)
-    plt.rcParams["axes.unicode_minus"] = False
+            plt.rcParams["axes.unicode_minus"] = False
+
+            print(
+                f"[REPORT] Chinese font loaded: {name}",
+                flush=True
+            )
+            return
+
+    print(
+        "[REPORT] WARNING: Chinese font missing",
+        flush=True
+    )
 
 
 def read_history(market: str) -> pd.Series:
