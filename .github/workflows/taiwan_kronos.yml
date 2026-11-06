@@ -42,12 +42,12 @@ on:
         type: number
         default: 20
 
-  schedule:
+  #schedule:
     # Taiwan Monday-Friday 17:10 (UTC Monday-Friday 09:10)
-    - cron: "10 9 * * 1-5"
+    #- cron: "10 9 * * 1-5"
     # Taiwan Tuesday-Saturday 06:20 (UTC Monday-Friday 22:20)
     # Same hour year-round despite US daylight saving time.
-    - cron: "20 22 * * 1-5"
+    #- cron: "20 22 * * 1-5"
 
 permissions:
   contents: read
