@@ -2320,12 +2320,112 @@ def main():
         )
 
         # 下載最新行情
+        
         taiex = fetch_taiex()
         raw = fetch_finmind()
+
+        if MODE == "live":
+            existing = make_tx_contract_bars(
+                raw
+            )
+
+            latest = (
+                select_front_contract(
+                    existing
+                ).iloc[-1]
+            )
+
+            expected = pd.Timestamp(
+                taiex.index[-1]
+            ).normalize()
+
+            finmind_date = pd.Timestamp(
+                latest["date"]
+            ).normalize()
+
+            has_night = bool(
+                latest["has_night"]
+            )
+
+            if finmind_date > expected:
+                raise RuntimeError(
+                    "TX newer than TAIEX: "
+                    f"{finmind_date.date()} > "
+                    f"{expected.date()}"
+                )
+
+            needs_fallback = (
+                finmind_date < expected
+                or not has_night
+            )
+
+            if needs_fallback:
+                log(
+                    "[TX FALLBACK] "
+                    f"FinMind={finmind_date.date()}, "
+                    f"night={has_night}, "
+                    f"expected={expected.date()}"
+                )
+
+                from scripts.taifex_latest import (
+                    merge_official_tx_latest
+                )
+
+                try:
+                    raw, official = (
+                        merge_official_tx_latest(
+                            raw,
+                            expected.date()
+                        )
+                    )
+
+                except Exception as exc:
+                    write_json(
+                        "taifex_fallback_status.json",
+                        {
+                            "success": False,
+                            "expected_date": str(
+                                expected.date()
+                            ),
+                            "error": str(exc)
+                        }
+                    )
+
+                    raise RuntimeError(
+                        "TAIFEX fallback failed: "
+                        f"{exc}"
+                    ) from exc
+
+                official.to_csv(
+                    OUTPUT / "taifex_fallback_rows.csv",
+                    index=False,
+                    encoding="utf-8-sig"
+                )
+
+                write_json(
+                    "taifex_fallback_status.json",
+                    {
+                        "success": True,
+                        "source":
+                            "TAIFEX official",
+                        "trading_date": str(
+                            expected.date()
+                        ),
+                        "session_rows": len(
+                            official
+                        )
+                    }
+                )
+
+                log(
+                    "[TX FALLBACK] "
+                    f"official rows={len(official)}"
+                )
 
         combined = make_tx_contract_bars(
             raw
         )
+
 
         combined.to_csv(
             OUTPUT / "tx_contract_bars.csv",
