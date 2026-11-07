@@ -149,6 +149,10 @@ def validate_tx(raw):
     ok = (df.date.notna() & contract_ok & month_ok & session_ok & ohlc_ok &
           (df.volume > 0) & np.isfinite(df.volume))
     invalid = int((~ok).sum())
+    # Reason counters are non-exclusive; blank/far-month quotes may fail more than one.
+    nonstandard_contract = int((~(contract_ok & month_ok & session_ok)).sum())
+    invalid_prices = int((~ohlc_ok).sum())
+    invalid_volume = int((~((df.volume > 0) & np.isfinite(df.volume))).sum())
     df = df.loc[ok].copy()
     keys = ["date", "contract_date", "trading_session"]
     duplicate = df.duplicated(keys, keep=False)
@@ -156,6 +160,9 @@ def validate_tx(raw):
     # Ambiguous duplicates are excluded and counted, never silently repaired.
     df = df.loc[~duplicate].sort_values(keys).reset_index(drop=True)
     return df, {"raw_rows": len(raw), "tx_rows": count, "invalid_rows": invalid,
+                "nonstandard_contract_or_session": nonstandard_contract,
+                "invalid_price_rows": invalid_prices,
+                "nonpositive_or_invalid_volume_rows": invalid_volume,
                 "duplicate_rows": dup_count, "valid_session_rows": len(df)}
 
 
@@ -259,10 +266,24 @@ def run(start, end, out, chunk_days=179):
                                     frames["NASDAQ"].index, frames["SOX"].index)
         aligned.to_csv(out / "cross_market_asof.csv", index=False, encoding="utf-8-sig")
         aligned_rows = len(aligned)
-    complete = (all(frames.get(m) is not None and len(frames[m]) >= 200 for m in SYMBOLS)
-                and len(full) >= 200 and not errors and
-                quality["duplicate_rows"] == 0 and quality["invalid_rows"] == 0)
+    tw_dates = set(frames["TAIEX"].index.strftime("%Y-%m-%d")) if frames.get("TAIEX") is not None else set()
+    full_dates = set(full.date.dt.strftime("%Y-%m-%d")) if len(full) else set()
+    front_dates = set(front.date.dt.strftime("%Y-%m-%d")) if len(front) else set()
+    common_full_days = len(tw_dates & full_dates)
+    front_coverage = len(full) / len(front) if len(front) else 0.0
+    research_ready = (all(frames.get(m) is not None and len(frames[m]) >= 200 for m in SYMBOLS)
+                      and common_full_days > 205 and front_coverage >= 0.98
+                      and not errors and quality["duplicate_rows"] == 0)
+    complete = (research_ready and len(full) == len(front)
+                and quality["invalid_rows"] == 0)
     status = {"version": "V3.5-A", "success": True, "complete": bool(complete),
+        "research_ready": bool(research_ready),
+        "tx_front_complete_ratio": round(front_coverage, 5),
+        "tx_incomplete_front_days": sorted(front_dates - full_dates),
+        "taiwan_tx_common_full_days": common_full_days,
+        "potential_200_bar_5_day_tw_origins": max(0, common_full_days - 205),
+        "taiex_days_missing_tx": sorted(tw_dates - front_dates),
+        "tx_front_days_not_in_taiex": sorted(front_dates - tw_dates),
         "requested_start": str(start), "requested_end": str(end),
         "markets": markets, "tx_quality": quality,
         "first_complete_tx_day": str(full.date.min().date()) if len(full) else None,
@@ -278,8 +299,13 @@ def run(start, end, out, chunk_days=179):
         lines.append(f"| {row['market']} | {row['earliest'] or '未取得'} | "
                      f"{row['latest'] or '未取得'} | {row['bars']} |")
     lines.extend(["", f"TX 最早完整日夜盤交易日：{status['first_complete_tx_day'] or '未取得'}",
-        f"TX 無效/重複紀錄：{quality['invalid_rows']}/{quality['duplicate_rows']}",
-        f"失敗下載區段：{len(errors)}", "",
+        f"TX 完整近月日夜盤比率：{front_coverage:.2%}",
+        f"TAIEX 與完整 TX 共同交易日：{common_full_days}",
+        f"估計 200 K＋預測 5 日的台股候選起點上限：{max(0, common_full_days - 205)}",
+        f"近月缺少夜盤日期：{sorted(front_dates - full_dates)}",
+        f"TX 無效/重複原始紀錄：{quality['invalid_rows']}/{quality['duplicate_rows']}",
+        f"無效合約或時段：{quality['nonstandard_contract_or_session']}；價格欄位不合規：{quality['invalid_price_rows']}；無效成交量：{quality['nonpositive_or_invalid_volume_rows']}",
+        f"來源請求失敗區段：{len(errors)}", "",
         "注意：本階段不做模型推論；最早日不代表十年期間所有交易日齊全。",
         "參照 yearly_coverage.csv、tx_front_sessions.csv、source_failures.csv。",
         "cross_market_asof.csv 包含台灣 17:10 與 06:20 當時可用的美股日 K。",
