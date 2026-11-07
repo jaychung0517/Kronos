@@ -188,7 +188,16 @@ def get_history(market, origin, frames, front, bars):
 
 
 def market_future(market, origin, frames, front):
-    dates = front.index if market == "TX" else frames[market].index
+    if market == "TX":
+        # TX and TAIEX must describe the *same* coming five Taiwan sessions.
+        # If any TX day/night is missing on a stock-market date, skip the
+        # affected origin rather than quietly shifting the TX forecast horizon.
+        dates = frames["TAIEX"].index
+        future = dates[dates > origin][:H]
+        if len(future) != H or not future.isin(front.index).all():
+            raise ValueError(f"TX: missing full day/night among next five TW sessions after {origin}")
+        return future
+    dates = frames[market].index
     after = dates[dates > origin][:H]
     if len(after) < H:
         raise ValueError(f"{market}: missing future sessions after {origin}")
@@ -206,12 +215,18 @@ def realized_return(market, origin, target, frames, front, bars):
 
 
 def eligible_origins(frames, front):
-    common = frames["TAIEX"].index.intersection(front.index).sort_values()
-    # Fixed 200 completed bars and future five sessions. US must independently
-    # possess 200 bars at each cutoff; individual worker validates this.
+    tw_dates = frames["TAIEX"].index
+    common = tw_dates.intersection(front.index).sort_values()
     if len(common) < 2205:
         raise ValueError(f"Too few TAIEX/TX common sessions for 2000 tests: {len(common)}")
-    return list(reversed(common[199:-5]))
+    candidates = []
+    for origin in common[199:]:
+        following = tw_dates[tw_dates > origin][:H]
+        if len(following) == H and following.isin(front.index).all():
+            candidates.append(origin)
+    # Fixed rank ordering across every 100/500/1000/2000 stage.
+    # Source OHLC is still truncated independently at each market origin.
+    return list(reversed(candidates))
 
 
 def run(snapshot, rank_start, rank_count, output):
