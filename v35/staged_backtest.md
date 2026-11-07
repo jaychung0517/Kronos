@@ -29,3 +29,5 @@ Each worker processes 100 historical Taiwan origins, using the same Kronos-base 
 
 ## Artifacts
 Snapshot, rank-shard forecast CSVs, cumulative stage reports and an accuracy/4-market-consensus summary at each target size. The first failed gate stops all later phases.
+
+The staged runner is triggered by pushes on its isolated feature branch and can be rerun manually after merging. No live-market cron or alerts are changed.
