@@ -1,0 +1,406 @@
+name: Kronos V3.5 - Automatic 100 500 1000 2000 Backtests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/kronos-v35-autostages
+    paths:
+      - scripts/kronos_v35_backtest.py
+      - scripts/kronos_v35_gate.py
+      - tests/test_kronos_v35_stages.py
+      - .github/workflows/kronos_v35_autostages.yml
+      - v35/staged_backtest.md
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kronos-v35-autostages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    name: One immutable four-market snapshot + validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install V3.5 audit and CPU test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt
+          python -m pip install yfinance requests
+      - name: Verify historical timestamp, OHLC and stage-gate unit tests
+        run: |
+          python -m py_compile scripts/kronos_v35_backtest.py scripts/kronos_v35_gate.py
+          python -m unittest discover -s tests -p 'test_kronos_v35.py' -v
+          python -m unittest discover -s tests -p 'test_kronos_v35_stages.py' -v
+      - name: Download ONE historical snapshot from 2017 onward
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: |
+          python -m scripts.kronos_v35_data_audit \
+            --start 2017-05-16 --out outputs_v35/audit
+      - name: Check research readiness and 2000-origin capacity
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path("outputs_v35/audit/audit_status.json")
+          s = json.loads(p.read_text(encoding="utf-8"))
+          assert s["research_ready"], "Market history failed quality readiness gate"
+          assert s["taiwan_tx_common_full_days"] >= 2205, "Too few TW/TX sessions"
+          assert s["potential_200_bar_5_day_tw_origins"] >= 2000, "No 2000-origin horizon"
+          assert s["source_failures"] == 0, "Missing external data chunks"
+          print("V3.5 snapshot quality gate passed.", flush=True)
+          PY
+      - name: Persist immutable snapshot for every stage
+        uses: actions/upload-artifact@v4
+        with:
+          name: v35-snapshot-${{ github.run_id }}
+          path: outputs_v35/audit/
+          if-no-files-found: error
+          retention-days: 30
+
+  stage_100:
+    name: Forecast stage 100, rank ${{ matrix.rank_start }}
+    needs: snapshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: true
+      max-parallel: 2
+      matrix:
+        rank_start: [0]
+    env:
+      OMP_NUM_THREADS: '2'
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install CPU inference dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt
+          python -m pip install yfinance requests
+      - name: Cache Kronos weights across stages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          key: v35-kronos-base-weights-nov2026
+      - name: Restore immutable audit snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: v35-snapshot-${{ github.run_id }}
+          path: outputs_v35/audit
+      - name: Run 100 historical origins
+        run: |
+          python -m scripts.kronos_v35_backtest \
+            --snapshot outputs_v35/audit/market_cache \
+            --rank-start ${{ matrix.rank_start }} \
+            --rank-count 100 \
+            --output outputs_v35/shards
+      - name: Upload forecast shard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v35-shard-${{ matrix.rank_start }}-${{ github.run_id }}
+          path: outputs_v35/shards/
+          if-no-files-found: warn
+          retention-days: 30
+
+  gate_100:
+    name: Validate 100 cumulative origins and publish report
+    needs: stage_100
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install report dependencies
+        run: python -m pip install 'numpy>=1.26,<3' 'pandas>=2.2,<3'
+      - name: Download all completed shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: v35-shard-*-${{ github.run_id }}
+          path: outputs_v35/shards
+          merge-multiple: true
+      - name: Run quality and leakage gate for 100 origins
+        run: |
+          python -m scripts.kronos_v35_gate \
+            --shards outputs_v35/shards --target 100 \
+            --out outputs_v35/stage_reports
+      - name: Upload stage 100 report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v35-report-100-${{ github.run_id }}
+          path: outputs_v35/stage_reports/
+          if-no-files-found: warn
+          retention-days: 60
+
+  stage_500:
+    name: Forecast stage 500, rank ${{ matrix.rank_start }}
+    needs: gate_100
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: true
+      max-parallel: 2
+      matrix:
+        rank_start: [100, 200, 300, 400]
+    env:
+      OMP_NUM_THREADS: '2'
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install CPU inference dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt
+          python -m pip install yfinance requests
+      - name: Cache Kronos weights across stages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          key: v35-kronos-base-weights-nov2026
+      - name: Restore immutable audit snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: v35-snapshot-${{ github.run_id }}
+          path: outputs_v35/audit
+      - name: Run 100 historical origins
+        run: |
+          python -m scripts.kronos_v35_backtest \
+            --snapshot outputs_v35/audit/market_cache \
+            --rank-start ${{ matrix.rank_start }} \
+            --rank-count 100 \
+            --output outputs_v35/shards
+      - name: Upload forecast shard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v35-shard-${{ matrix.rank_start }}-${{ github.run_id }}
+          path: outputs_v35/shards/
+          if-no-files-found: warn
+          retention-days: 30
+
+  gate_500:
+    name: Validate 500 cumulative origins and publish report
+    needs: stage_500
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install report dependencies
+        run: python -m pip install 'numpy>=1.26,<3' 'pandas>=2.2,<3'
+      - name: Download all completed shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: v35-shard-*-${{ github.run_id }}
+          path: outputs_v35/shards
+          merge-multiple: true
+      - name: Run quality and leakage gate for 500 origins
+        run: |
+          python -m scripts.kronos_v35_gate \
+            --shards outputs_v35/shards --target 500 \
+            --out outputs_v35/stage_reports
+      - name: Upload stage 500 report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v35-report-500-${{ github.run_id }}
+          path: outputs_v35/stage_reports/
+          if-no-files-found: warn
+          retention-days: 60
+
+  stage_1000:
+    name: Forecast stage 1000, rank ${{ matrix.rank_start }}
+    needs: gate_500
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: true
+      max-parallel: 2
+      matrix:
+        rank_start: [500, 600, 700, 800, 900]
+    env:
+      OMP_NUM_THREADS: '2'
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install CPU inference dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt
+          python -m pip install yfinance requests
+      - name: Cache Kronos weights across stages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          key: v35-kronos-base-weights-nov2026
+      - name: Restore immutable audit snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: v35-snapshot-${{ github.run_id }}
+          path: outputs_v35/audit
+      - name: Run 100 historical origins
+        run: |
+          python -m scripts.kronos_v35_backtest \
+            --snapshot outputs_v35/audit/market_cache \
+            --rank-start ${{ matrix.rank_start }} \
+            --rank-count 100 \
+            --output outputs_v35/shards
+      - name: Upload forecast shard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v35-shard-${{ matrix.rank_start }}-${{ github.run_id }}
+          path: outputs_v35/shards/
+          if-no-files-found: warn
+          retention-days: 30
+
+  gate_1000:
+    name: Validate 1000 cumulative origins and publish report
+    needs: stage_1000
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install report dependencies
+        run: python -m pip install 'numpy>=1.26,<3' 'pandas>=2.2,<3'
+      - name: Download all completed shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: v35-shard-*-${{ github.run_id }}
+          path: outputs_v35/shards
+          merge-multiple: true
+      - name: Run quality and leakage gate for 1000 origins
+        run: |
+          python -m scripts.kronos_v35_gate \
+            --shards outputs_v35/shards --target 1000 \
+            --out outputs_v35/stage_reports
+      - name: Upload stage 1000 report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v35-report-1000-${{ github.run_id }}
+          path: outputs_v35/stage_reports/
+          if-no-files-found: warn
+          retention-days: 60
+
+  stage_2000:
+    name: Forecast stage 2000, rank ${{ matrix.rank_start }}
+    needs: gate_1000
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: true
+      max-parallel: 2
+      matrix:
+        rank_start: [1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900]
+    env:
+      OMP_NUM_THREADS: '2'
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install CPU inference dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt
+          python -m pip install yfinance requests
+      - name: Cache Kronos weights across stages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          key: v35-kronos-base-weights-nov2026
+      - name: Restore immutable audit snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: v35-snapshot-${{ github.run_id }}
+          path: outputs_v35/audit
+      - name: Run 100 historical origins
+        run: |
+          python -m scripts.kronos_v35_backtest \
+            --snapshot outputs_v35/audit/market_cache \
+            --rank-start ${{ matrix.rank_start }} \
+            --rank-count 100 \
+            --output outputs_v35/shards
+      - name: Upload forecast shard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v35-shard-${{ matrix.rank_start }}-${{ github.run_id }}
+          path: outputs_v35/shards/
+          if-no-files-found: warn
+          retention-days: 30
+
+  gate_2000:
+    name: Validate 2000 cumulative origins and publish report
+    needs: stage_2000
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install report dependencies
+        run: python -m pip install 'numpy>=1.26,<3' 'pandas>=2.2,<3'
+      - name: Download all completed shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: v35-shard-*-${{ github.run_id }}
+          path: outputs_v35/shards
+          merge-multiple: true
+      - name: Run quality and leakage gate for 2000 origins
+        run: |
+          python -m scripts.kronos_v35_gate \
+            --shards outputs_v35/shards --target 2000 \
+            --out outputs_v35/stage_reports
+      - name: Upload stage 2000 report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v35-report-2000-${{ github.run_id }}
+          path: outputs_v35/stage_reports/
+          if-no-files-found: warn
+          retention-days: 60
+
