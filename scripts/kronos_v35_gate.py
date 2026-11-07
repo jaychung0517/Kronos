@@ -25,7 +25,7 @@ def verify(data, total):
     missing = needed - set(data.columns)
     if missing:
         raise ValueError(f"Missing result columns: {sorted(missing)}")
-    if data.empty or data.isna(subset=list(needed)).any().any():
+    if data.empty or data[list(needed)].isna().any().any():
         raise ValueError("Empty or null forecast results")
     if not set(data["rank"]) == set(range(total)):
         raise ValueError("Rank coverage does not match 0..target-1")
