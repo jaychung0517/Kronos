@@ -1,0 +1,74 @@
+name: Kronos V3.5 - Independent Historical Research
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Historical start date for data audit'
+        type: string
+        required: true
+        default: '2017-05-16'
+      end_date:
+        description: 'End date YYYY-MM-DD, blank means today'
+        type: string
+        required: false
+        default: ''
+  push:
+    branches:
+      - 'feature/kronos-v35-*'
+    paths:
+      - 'scripts/kronos_v35_*'
+      - 'tests/test_kronos_v35.py'
+      - '.github/workflows/kronos_v35_backtest.yml'
+      - 'v35/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kronos-v35-audit-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  data-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout V3.5 research
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install data-audit dependencies (no model or torch)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'pandas>=2.2,<3' 'numpy>=1.26,<3' 'yfinance>=0.2.50' 'requests>=2.31'
+
+      - name: Offline syntax and unit tests
+        run: |
+          python -m py_compile scripts/kronos_v35_data_audit.py
+          python -m unittest discover -s tests -p 'test_kronos_v35.py' -v
+
+      - name: Verify historical data coverage
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          V35_START: ${{ inputs.start_date || '2017-05-16' }}
+          V35_END: ${{ inputs.end_date || '' }}
+        run: |
+          if [ -n "$V35_END" ]; then
+            python -m scripts.kronos_v35_data_audit --start "$V35_START" --end "$V35_END"
+          else
+            python -m scripts.kronos_v35_data_audit --start "$V35_START"
+          fi
+
+      - name: Upload V3.5 research results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kronos-v35-audit-${{ github.run_id }}
+          path: outputs_v35/audit/
+          if-no-files-found: warn
+          retention-days: 30
