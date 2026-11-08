@@ -134,7 +134,7 @@ def last_market_date(market, available_dates, cutoff):
                  if close_time(market, d) <= cutoff), None)
 
 
-def session_times(tw_day, next_tw_day, us_dates):
+def session_times(tw_day, next_tw_day, us_dates, tx_dates=None):
     twclose = datetime.combine(pd.Timestamp(tw_day).date(), clock(17, 10), tzinfo=TPE)
     nextopen = datetime.combine(pd.Timestamp(next_tw_day).date(), clock(8, 45), tzinfo=TPE)
     result = [("TW_CLOSE", twclose)]
@@ -145,7 +145,10 @@ def session_times(tw_day, next_tw_day, us_dates):
         usclose = max(newest)
         morning = datetime.combine(usclose.date(), clock(6, 20), tzinfo=TPE)
         if usclose <= morning < nextopen:
-            result.append(("US_CLOSE", morning))
+            # A TX session can advance during a TAIEX holiday. Never pair
+            # that future TX bar with an older Taiwan cash-market origin.
+            if tx_dates is None or last_market_date("TX", tx_dates, morning) == pd.Timestamp(tw_day):
+                result.append(("US_CLOSE", morning))
     return result
 
 
@@ -257,7 +260,7 @@ def run(snapshot, rank_start, rank_count, output):
     for i, tw_origin in enumerate(subset):
         tw_pos = frames["TAIEX"].index.get_loc(tw_origin)
         next_tw = frames["TAIEX"].index[tw_pos + 1]
-        sessions = session_times(tw_origin, next_tw, frames["NASDAQ"].index)
+        sessions = session_times(tw_origin, next_tw, frames["NASDAQ"].index, front.index)
         for session, cutoff in sessions:
             for market in MARKETS:
                 local_dates = front.index if market == "TX" else frames[market].index
