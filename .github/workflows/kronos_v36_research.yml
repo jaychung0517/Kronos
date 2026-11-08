@@ -1,0 +1,64 @@
+name: Kronos V3.6 - Frozen V3.5 calibration research
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/kronos-v36-calibration-research
+    paths:
+      - scripts/kronos_v36_research.py
+      - tests/test_kronos_v36.py
+      - .github/workflows/kronos_v36_research.yml
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: kronos-v36-research-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  v36:
+    name: Verify and evaluate frozen V3.5 artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install research dependencies
+        run: python -m pip install 'numpy>=1.26,<3' 'pandas>=2.2,<3'
+      - name: Compile and run regression tests
+        run: |
+          python -m py_compile scripts/kronos_v36_research.py
+          python -m unittest discover -s tests -p 'test_kronos_v36.py' -v
+      - name: Download immutable successful V3.5 stage reports
+        run: |
+          set -euo pipefail
+          mkdir -p outputs_v35/stage_reports
+          for stage in 100 500 1000 2000; do
+            gh run download 42431782186 -R jaychung0517/Kronos \
+              -n "v35-report-${stage}-42431782186" \
+              -D "outputs_v35/stage_reports"
+            test -s "outputs_v35/stage_reports/origins_${stage}.csv"
+            test -s "outputs_v35/stage_reports/stage_${stage}.json"
+            python -c "import json,sys; s=json.load(open(sys.argv[1])); assert s['success'] is True and s['stage']==int(sys.argv[2])" \
+              "outputs_v35/stage_reports/stage_${stage}.json" "${stage}"
+          done
+      - name: Evaluate fixed walk-forward experiments
+        run: |
+          python -m scripts.kronos_v36_research \
+            --inputs outputs_v35/stage_reports/origins_{100,500,1000,2000}.csv \
+            --out outputs_v36
+      - name: Upload V3.6 research reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v36-research-${{ github.run_id }}
+          path: outputs_v36/
+          if-no-files-found: warn
+          retention-days: 60
