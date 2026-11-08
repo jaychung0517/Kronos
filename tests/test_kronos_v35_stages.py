@@ -22,6 +22,20 @@ class V35StageTests(unittest.TestCase):
         self.assertEqual(events[-1][1].strftime("%Y-%m-%d %H:%M"),
                          "2026-11-07 06:20")
 
+    def test_tx_holiday_advance_suppresses_stale_tw_us_close(self):
+        usa = pd.DatetimeIndex(["2021-04-05"])
+        tx = pd.DatetimeIndex(["2021-04-01", "2021-04-06"])
+        events = session_times(pd.Timestamp("2021-04-01"),
+                               pd.Timestamp("2021-04-07"), usa, tx)
+        self.assertEqual([name for name, _ in events], ["TW_CLOSE"])
+
+    def test_tx_stays_at_tw_origin_allows_us_close(self):
+        usa = pd.DatetimeIndex(["2026-11-06"])
+        tx = pd.DatetimeIndex(["2026-11-05", "2026-11-06"])
+        events = session_times(pd.Timestamp("2026-11-06"),
+                               pd.Timestamp("2026-11-09"), usa, tx)
+        self.assertEqual([name for name, _ in events], ["TW_CLOSE", "US_CLOSE"])
+
     def test_us_close_not_created_without_new_us_session(self):
         usa = pd.DatetimeIndex(["2026-11-05"])
         events = session_times(pd.Timestamp("2026-11-06"),
