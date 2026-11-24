@@ -1,5 +1,6 @@
 """Research only: no messaging or orders. Historical reruns are retrospective."""
 import os
+import hashlib
 from pathlib import Path
 import subprocess
 import numpy as np
@@ -46,19 +47,26 @@ def main():
     model.eval();tokenizer.eval()
     predictor=KronosPredictor(model,tokenizer,device="cpu",max_context=512)
     rows=[]; diagnostic=[]
-    for market,symbol in {"NASDAQ":"^IXIC","SOX":"^SOX"}.items():
+    # Round 4: independent Taiwan index replication, fixed retrospective cutoff.
+    for market,symbol in {"TAIEX":"^TWII"}.items():
         f=yf.download(symbol,start="2024-01-01",end="2026-11-24",auto_adjust=False,progress=False,multi_level_index=False)
         f.columns=[str(c).lower() for c in f.columns]
         f=f.sort_index()
+        if f.index.tz is not None: f.index=f.index.tz_localize(None)
+        f.index=f.index.normalize()
+        if f.index.has_duplicates: raise ValueError("duplicate dates")
+        f.to_csv(OUT/f"{market}_input.csv")
+        print("input SHA256",market,hashlib.sha256((OUT/f"{market}_input.csv").read_bytes()).hexdigest())
         tw.validate_ohlc(f,market)
         origins=f.loc["2026-11-09":"2026-11-23"].index
-        if len(origins)!=11: raise ValueError("unexpected origin count")
+        if len(origins)<8: raise ValueError("insufficient origins")
         for k,origin in enumerate(origins):
             hist=f.loc[:origin]
-            dates=future_us_dates(origin)
+            dates,calendar=tw.future_market_dates(origin)
+            if calendar!="csv_calendar": raise ValueError("official calendar required")
             ref=float(hist.close.iloc[-1])
             gap=(hist.close.tail(200).mean()/ref-1)*100
-            diagnostic.append(dict(market=market,origin=origin,mean_gap_pct=gap,archived_d3_pct=LOGGED[market][k]))
+            diagnostic.append(dict(market=market,origin=origin,mean_gap_pct=gap))
             for group,n,volume in [("L200",200,False),("L400",400,False),("L200N400",200,False),("L400N200",400,False)]:
                 h=hist.tail(n).copy()
                 if len(h)!=n: raise ValueError("insufficient history")
@@ -66,7 +74,7 @@ def main():
                     rows.append(dict(market=market,origin=origin,group=group,status="volume unavailable"))
                     continue
                 for seed_i in range(3):
-                    seed=tw.experiment_seed(market,origin,seed_i)+(10000 if market=="NASDAQ" else 20000)
+                    seed=tw.experiment_seed(market,origin,seed_i)+30000
                     tw.seed_everything(seed)
                     cols=tw.OHLC+(["volume"] if volume else [])
                     raw=controlled_predict(predictor,h,hist.tail(int(group.split("N")[1]) if "N" in group else n),dates)
@@ -82,7 +90,7 @@ def main():
                         rows.append(dict(market=market,origin=origin,group=group,seed=seed_i,horizon=step,target=date,pred_pct=(float(raw.close.iloc[step-1])/ref-1)*100,actual_pct=actual,momentum_pct=(ref/float(hist.close.iloc[-step-1])-1)*100,mean_reversion_pct=gap,ohlc_valid=bool(valid.iloc[step-1]),status="ok"))
     r=pd.DataFrame(rows); r.to_csv(OUT/"seed_results.csv",index=False)
     d=pd.DataFrame(diagnostic);d.to_csv(OUT/"mean_gap.csv",index=False)
-    d.groupby("market")[["mean_gap_pct","archived_d3_pct"]].corr(method="spearman").to_csv(OUT/"gap_correlation.csv")
+    # No original US forecast values are reused for Taiwan.
     a=r[r.status=="ok"].groupby(["market","origin","group","horizon"],as_index=False).agg(pred_pct=("pred_pct","mean"),median_pct=("pred_pct","median"),actual_pct=("actual_pct","first"),valid_rate=("ohlc_valid","mean"),momentum_pct=("momentum_pct","first"),mean_reversion_pct=("mean_reversion_pct","first"))
     a.to_csv(OUT/"averaged.csv",index=False)
     a=a.dropna(subset=["actual_pct"])
@@ -101,5 +109,6 @@ def main():
     a["down_recall"]=a.hit.where(a.actual_pct<0)
     a.groupby(["market","group","horizon"]).agg(n=("hit","size"),momentum_accuracy=("momentum_hit","mean"),mean_reversion_accuracy=("mean_reversion_hit","mean"),accuracy=("hit","mean"),up_fraction=("up","mean"),always_up=("always_up","mean"),always_down=("always_down","mean"),mean_error=("error","mean"),mae=("abs_error","mean"),zero_mae=("zero_mae","mean"),extreme_rate=("extreme","mean"),median_accuracy=("median_hit","mean"),up_recall=("up_recall","mean"),down_recall=("down_recall","mean"),valid_rate=("valid_rate","mean")).to_csv(OUT/"metrics.csv")
     print((OUT/"metrics.csv").read_text())
+    print("retrospective Taiwan index only; TX requires as-of contract reconstruction")
 if __name__=="__main__":
     main()
