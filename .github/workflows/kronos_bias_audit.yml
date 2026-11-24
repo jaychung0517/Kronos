@@ -1,0 +1,37 @@
+name: Kronos bias audit
+on:
+  push:
+    branches: [research/kronos-bias-audit]
+    paths:
+      - scripts/kronos_bias_audit.py
+      - .github/workflows/kronos_bias_audit.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OMP_NUM_THREADS: '2'
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m py_compile scripts/kronos_bias_audit.py
+      - run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          pip install yfinance pandas_market_calendars matplotlib requests beautifulsoup4
+      - run: python -m unittest discover -s tests -p 'test_taiwan_experiments.py' -v
+      - run: python -m scripts.kronos_bias_audit
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kronos-bias-audit-${{ github.run_id }}
+          path: bias_audit_outputs/
+          retention-days: 90
